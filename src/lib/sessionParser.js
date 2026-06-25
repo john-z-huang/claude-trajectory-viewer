@@ -21,6 +21,71 @@ function normalizeLineEndings(text) {
   return text.replace(/\r\n/g, "\n");
 }
 
+function normalizeRelativePath(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+function getBaseName(path) {
+  const normalized = normalizeRelativePath(path);
+  if (!normalized) {
+    return "";
+  }
+
+  const parts = normalized.split("/");
+  return parts.at(-1) || "";
+}
+
+function getDirectoryName(path) {
+  const normalized = normalizeRelativePath(path);
+  if (!normalized || !normalized.includes("/")) {
+    return "";
+  }
+
+  return normalized.slice(0, normalized.lastIndexOf("/"));
+}
+
+function stripSharedRoot(entries) {
+  const firstSegments = new Set(
+    entries
+      .map((entry) => normalizeRelativePath(entry.relativePath || entry.name))
+      .filter(Boolean)
+      .map((path) => path.split("/")[0]),
+  );
+
+  if (firstSegments.size !== 1) {
+    return {
+      rootName: "",
+      files: entries.map((entry) => ({
+        ...entry,
+        relativePath: normalizeRelativePath(entry.relativePath || entry.name),
+      })),
+    };
+  }
+
+  const [rootName] = [...firstSegments];
+  const prefix = `${rootName}/`;
+
+  return {
+    rootName,
+    files: entries.map((entry) => {
+      const originalPath = normalizeRelativePath(entry.relativePath || entry.name);
+      const nextPath = originalPath.startsWith(prefix)
+        ? originalPath.slice(prefix.length)
+        : originalPath === rootName
+          ? ""
+          : originalPath;
+
+      return {
+        ...entry,
+        relativePath: nextPath || entry.name,
+      };
+    }),
+  };
+}
+
 function parseJsonLine(line, lineNumber) {
   try {
     return {
@@ -37,6 +102,15 @@ function parseJsonLine(line, lineNumber) {
       raw: line,
     };
   }
+}
+
+function parseJsonLines(sourceText) {
+  const normalized = normalizeLineEndings(sourceText);
+  return normalized
+    .split("\n")
+    .map((line, index) => ({ line, lineNumber: index + 1 }))
+    .filter(({ line }) => line.trim().length > 0)
+    .map(({ line, lineNumber }) => parseJsonLine(line, lineNumber));
 }
 
 function sortTimeline(a, b) {
@@ -396,14 +470,7 @@ function buildFieldGuide() {
   };
 }
 
-export function parseSessionText(sourceText, sourceName = "session.jsonl") {
-  const normalized = normalizeLineEndings(sourceText);
-  const parsedLines = normalized
-    .split("\n")
-    .map((line, index) => ({ line, lineNumber: index + 1 }))
-    .filter(({ line }) => line.trim().length > 0)
-    .map(({ line, lineNumber }) => parseJsonLine(line, lineNumber));
-
+function toSessionRecords(parsedLines) {
   const errors = parsedLines
     .filter((entry) => entry.error)
     .map(({ lineNumber, error, raw }) => ({
@@ -422,6 +489,57 @@ export function parseSessionText(sourceText, sourceName = "session.jsonl") {
         TIMELINE_TYPES.has(value.type) || Boolean(value.timestamp),
       isMetaRecord: META_TYPES.has(value.type),
     }));
+
+  return { errors, records };
+}
+
+function parseJsonObjectText(sourceText, sourceName) {
+  try {
+    return {
+      data: JSON.parse(sourceText),
+      error: null,
+      sourceName,
+    };
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : "Invalid JSON",
+      sourceName,
+    };
+  }
+}
+
+function getAgentIdFromSourceName(sourceName) {
+  const match = /agent-([^.]+)\.jsonl$/i.exec(sourceName);
+  return match?.[1] || null;
+}
+
+function compareNullableTimestamps(left, right) {
+  if (left && right && left !== right) {
+    return left.localeCompare(right);
+  }
+
+  if (left && !right) {
+    return -1;
+  }
+
+  if (!left && right) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function buildJournalSummary(records) {
+  return {
+    startedCount: records.filter((record) => record.type === "started").length,
+    resultCount: records.filter((record) => record.type === "result").length,
+  };
+}
+
+export function parseSessionText(sourceText, sourceName = "session.jsonl") {
+  const parsedLines = parseJsonLines(sourceText);
+  const { errors, records } = toSessionRecords(parsedLines);
 
   const timeline = records
     .filter((record) => record.isTimelineRecord)
@@ -456,5 +574,265 @@ export function parseSessionText(sourceText, sourceName = "session.jsonl") {
       timelineTypeCounts: formatTypeCounts(timeline),
     },
     fieldGuide: buildFieldGuide(),
+  };
+}
+
+export function parseJournalText(sourceText, sourceName = "journal.jsonl") {
+  const parsedLines = parseJsonLines(sourceText);
+  const errors = parsedLines
+    .filter((entry) => entry.error)
+    .map(({ lineNumber, error, raw }) => ({
+      lineNumber,
+      error,
+      raw,
+    }));
+
+  const records = parsedLines
+    .filter((entry) => entry.value)
+    .map(({ value, lineNumber, raw }) => ({
+      ...value,
+      lineNumber,
+      raw,
+    }));
+
+  return {
+    sourceName,
+    records,
+    errors,
+    summary: buildJournalSummary(records),
+  };
+}
+
+export function parseSubAgentDirectory(entries) {
+  const supportedEntries = entries
+    .map((entry) => ({
+      ...entry,
+      relativePath: normalizeRelativePath(entry.relativePath || entry.name),
+    }))
+    .filter((entry) => entry.relativePath)
+    .filter((entry) => /\.(jsonl|meta\.json)$/i.test(entry.relativePath))
+    .filter((entry) => !entry.relativePath.startsWith("."));
+
+  const { rootName, files } = stripSharedRoot(supportedEntries);
+  const workflows = new Map();
+
+  for (const file of files) {
+    const directoryPath = getDirectoryName(file.relativePath);
+    const workflowKey = directoryPath || ".";
+    const workflowLabel = workflowKey === "." ? rootName || "root" : getBaseName(workflowKey);
+
+    if (!workflows.has(workflowKey)) {
+      workflows.set(workflowKey, {
+        key: workflowKey,
+        label: workflowLabel,
+        relativePath: workflowKey,
+        sessionFiles: [],
+        metaFiles: [],
+        journalFile: null,
+      });
+    }
+
+    const workflow = workflows.get(workflowKey);
+    const baseName = getBaseName(file.relativePath);
+
+    if (baseName === "journal.jsonl") {
+      workflow.journalFile = file;
+      continue;
+    }
+
+    if (/\.meta\.json$/i.test(baseName)) {
+      workflow.metaFiles.push(file);
+      continue;
+    }
+
+    if (/\.jsonl$/i.test(baseName)) {
+      workflow.sessionFiles.push(file);
+    }
+  }
+
+  const workflowList = [...workflows.values()]
+    .map((workflow) => {
+      const errors = [];
+      const warnings = [];
+      const metaByAgentId = new Map();
+      const sessionByAgentId = new Map();
+      const journal = workflow.journalFile
+        ? parseJournalText(workflow.journalFile.text, workflow.journalFile.relativePath)
+        : null;
+
+      if (journal?.errors.length) {
+        errors.push(
+          ...journal.errors.map((item) => ({
+            scope: "journal",
+            file: journal.sourceName,
+            ...item,
+          })),
+        );
+      }
+
+      for (const metaFile of workflow.metaFiles) {
+        const parsedMeta = parseJsonObjectText(metaFile.text, metaFile.relativePath);
+        const agentId = getAgentIdFromSourceName(metaFile.relativePath.replace(/\.meta\.json$/i, ".jsonl"));
+
+        if (parsedMeta.error) {
+          errors.push({
+            scope: "meta",
+            file: metaFile.relativePath,
+            error: parsedMeta.error,
+          });
+          continue;
+        }
+
+        if (agentId) {
+          metaByAgentId.set(agentId, parsedMeta.data);
+        }
+      }
+
+      for (const sessionFile of workflow.sessionFiles) {
+        const sessionData = parseSessionText(sessionFile.text, getBaseName(sessionFile.relativePath));
+        const agentId =
+          getAgentIdFromSourceName(sessionFile.relativePath) ||
+          sessionData.records.find((record) => record.agentId)?.agentId ||
+          null;
+
+        const entry = {
+          key: sessionFile.relativePath,
+          agentId,
+          relativePath: sessionFile.relativePath,
+          sourceName: sessionData.sourceName,
+          sessionData,
+          meta: agentId ? metaByAgentId.get(agentId) || null : null,
+          journalStartedRecord: null,
+          journalResultRecord: null,
+          workflowKey: workflow.key,
+          workflowLabel: workflow.label,
+          orderIndex: Number.POSITIVE_INFINITY,
+        };
+
+        if (!agentId) {
+          warnings.push(`无法从 ${sessionFile.relativePath} 推断 agentId。`);
+        } else {
+          sessionByAgentId.set(agentId, entry);
+        }
+      }
+
+      const orderedSessions = [];
+      const seenAgentIds = new Set();
+
+      if (journal) {
+        journal.records.forEach((record, index) => {
+          if (!record.agentId) {
+            return;
+          }
+
+          const session = sessionByAgentId.get(record.agentId);
+          if (!session) {
+            warnings.push(
+              `${journal.sourceName} 第 ${record.lineNumber} 行引用了缺失的 agent-${record.agentId}.jsonl。`,
+            );
+            return;
+          }
+
+          if (record.type === "started" && !seenAgentIds.has(record.agentId)) {
+            session.journalStartedRecord = record;
+            session.orderIndex = index;
+            orderedSessions.push(session);
+            seenAgentIds.add(record.agentId);
+          }
+
+          if (record.type === "result") {
+            session.journalResultRecord = record;
+          }
+        });
+      } else {
+        warnings.push(`${workflow.label} 缺少 journal.jsonl，已退回按会话起始时间排序。`);
+      }
+
+      for (const session of sessionByAgentId.values()) {
+        if (!seenAgentIds.has(session.agentId)) {
+          orderedSessions.push(session);
+        }
+      }
+
+      orderedSessions.sort((left, right) => {
+        const leftHasOrder = Number.isFinite(left.orderIndex);
+        const rightHasOrder = Number.isFinite(right.orderIndex);
+
+        if (leftHasOrder && rightHasOrder && left.orderIndex !== right.orderIndex) {
+          return left.orderIndex - right.orderIndex;
+        }
+
+        if (leftHasOrder && !rightHasOrder) {
+          return -1;
+        }
+
+        if (!leftHasOrder && rightHasOrder) {
+          return 1;
+        }
+
+        const timestampComparison = compareNullableTimestamps(
+          left.sessionData.summary.startedAt,
+          right.sessionData.summary.startedAt,
+        );
+        if (timestampComparison !== 0) {
+          return timestampComparison;
+        }
+
+        return left.relativePath.localeCompare(right.relativePath);
+      });
+
+      orderedSessions.forEach((session, index) => {
+        session.sequenceNumber = index + 1;
+      });
+
+      return {
+        key: workflow.key,
+        label: workflow.label,
+        relativePath: workflow.relativePath,
+        sessions: orderedSessions,
+        journal,
+        warnings,
+        errors,
+        summary: {
+          sessionCount: orderedSessions.length,
+          startedCount: journal?.summary.startedCount || 0,
+          resultCount: journal?.summary.resultCount || 0,
+        },
+      };
+    })
+    .sort((left, right) => {
+      const leftStart = left.sessions[0]?.sessionData.summary.startedAt || null;
+      const rightStart = right.sessions[0]?.sessionData.summary.startedAt || null;
+      const timestampComparison = compareNullableTimestamps(leftStart, rightStart);
+      if (timestampComparison !== 0) {
+        return timestampComparison;
+      }
+
+      return left.relativePath.localeCompare(right.relativePath);
+    });
+
+  const orderedSessions = workflowList.flatMap((workflow, workflowIndex) =>
+    workflow.sessions.map((session, sessionIndex) => ({
+      ...session,
+      workflowSequence: workflowIndex + 1,
+      globalSequence: sessionIndex + 1,
+    })),
+  );
+
+  orderedSessions.forEach((session, index) => {
+    session.globalSequence = index + 1;
+  });
+
+  return {
+    rootName: rootName || "subagents",
+    workflows: workflowList,
+    orderedSessions,
+    summary: {
+      workflowCount: workflowList.length,
+      sessionCount: orderedSessions.length,
+      journalCount: workflowList.filter((workflow) => workflow.journal).length,
+      errorCount: workflowList.reduce((count, workflow) => count + workflow.errors.length, 0),
+      warningCount: workflowList.reduce((count, workflow) => count + workflow.warnings.length, 0),
+    },
   };
 }
