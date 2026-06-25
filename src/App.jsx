@@ -1,12 +1,18 @@
 import React, { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { parseSessionText, parseSubAgentDirectory } from "./lib/sessionParser";
+import {
+  parseSessionText,
+  parseSubAgentDirectory,
+  parseWorkflowText,
+} from "./lib/sessionParser";
 
 const DEFAULT_SESSION_URL = new URL(
   "../8ab6ca2d-ece3-4e1f-8b10-beba29afd2d8.jsonl",
   import.meta.url,
 ).href;
+
+const DEFAULT_WORKFLOW_URL = new URL("../wf_5b655dd5-b9c.json", import.meta.url).href;
 
 const TYPE_TABS = [
   { value: "all", label: "全部" },
@@ -17,8 +23,15 @@ const TYPE_TABS = [
   { value: "queue-operation", label: "queue" },
 ];
 
+const WORKFLOW_PROGRESS_TABS = [
+  { value: "all", label: "全部" },
+  { value: "workflow_phase", label: "phase" },
+  { value: "workflow_agent", label: "agent" },
+];
+
 const VIEW_TABS = [
   { value: "session", label: "单 Session" },
+  { value: "workflow", label: "单 Workflow" },
   { value: "subagents", label: "Sub Agent 目录" },
 ];
 
@@ -49,7 +62,29 @@ function formatCompactDateTime(value) {
 }
 
 function formatCount(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "N/A";
+  }
+
   return new Intl.NumberFormat("zh-CN").format(value);
+}
+
+function formatDuration(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "N/A";
+  }
+
+  if (value < 1000) {
+    return `${value} ms`;
+  }
+
+  if (value < 60_000) {
+    return `${(value / 1000).toFixed(1)} s`;
+  }
+
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
 }
 
 function buildResultPreview(value) {
@@ -84,7 +119,7 @@ function MetadataList({ items }) {
 }
 
 function ContentBlock({ block }) {
-  if (!block.text) {
+  if (!block?.text) {
     return null;
   }
 
@@ -116,6 +151,39 @@ function ContentBlock({ block }) {
   );
 }
 
+function GuidePanel({ title, items }) {
+  return (
+    <section className="panel">
+      <h2>{title}</h2>
+      {items.map((item) => (
+        <div className="field-item" key={item.field}>
+          <code>{item.field}</code>
+          <p>{item.purpose}</p>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function BlockPanel({ title, blocks, emptyText }) {
+  const visibleBlocks = blocks.filter((block) => block?.text);
+
+  return (
+    <section className="panel">
+      <h2>{title}</h2>
+      {visibleBlocks.length > 0 ? (
+        <div className="timeline-body">
+          {visibleBlocks.map((block, index) => (
+            <ContentBlock block={block} key={`${title}-${index}`} />
+          ))}
+        </div>
+      ) : (
+        <div className="timeline-empty">{emptyText}</div>
+      )}
+    </section>
+  );
+}
+
 function TimelineCard({ record }) {
   return (
     <article className={`timeline-card timeline-${record.type}`}>
@@ -125,7 +193,7 @@ function TimelineCard({ record }) {
           <div className="timeline-subline">
             <span>{formatDateTime(record.timestamp)}</span>
             <span>line {record.lineNumber}</span>
-            {record.parentUuid ? <span>parent</span> : <span>root</span>}
+            <span>{record.contextLabel || (record.parentUuid ? "parent" : "root")}</span>
           </div>
         </div>
         <div className="timeline-badge">{record.type}</div>
@@ -169,35 +237,12 @@ function SessionPanels({ sessionData, extraPanels = [] }) {
         <MetadataList items={summaryItems} />
       </section>
 
-      <section className="panel">
-        <h2>必要字段</h2>
-        {sessionData.fieldGuide.essential.map((item) => (
-          <div className="field-item" key={item.field}>
-            <code>{item.field}</code>
-            <p>{item.purpose}</p>
-          </div>
-        ))}
-      </section>
-
-      <section className="panel">
-        <h2>顺序与上下文</h2>
-        {sessionData.fieldGuide.ordering.concat(sessionData.fieldGuide.linkage).map((item) => (
-          <div className="field-item" key={item.field}>
-            <code>{item.field}</code>
-            <p>{item.purpose}</p>
-          </div>
-        ))}
-      </section>
-
-      <section className="panel">
-        <h2>Markdown 字段</h2>
-        {sessionData.fieldGuide.markdown.map((item) => (
-          <div className="field-item" key={item.field}>
-            <code>{item.field}</code>
-            <p>{item.purpose}</p>
-          </div>
-        ))}
-      </section>
+      <GuidePanel title="必要字段" items={sessionData.fieldGuide.essential} />
+      <GuidePanel
+        title="顺序与上下文"
+        items={sessionData.fieldGuide.ordering.concat(sessionData.fieldGuide.linkage)}
+      />
+      <GuidePanel title="Markdown 字段" items={sessionData.fieldGuide.markdown} />
 
       <section className="panel">
         <h2>记录类型分布</h2>
@@ -216,6 +261,74 @@ function SessionPanels({ sessionData, extraPanels = [] }) {
           {sessionData.errors.map((item) => (
             <div className="field-item" key={item.lineNumber}>
               <code>line {item.lineNumber}</code>
+              <p>{item.error}</p>
+            </div>
+          ))}
+        </section>
+      ) : null}
+    </>
+  );
+}
+
+function WorkflowPanels({ workflowData }) {
+  const summaryItems = [
+    { key: "Workflow", value: workflowData.summary.title },
+    { key: "runId", value: workflowData.summary.runId || "N/A" },
+    { key: "taskId", value: workflowData.summary.taskId || "N/A" },
+    { key: "状态", value: workflowData.summary.status || "N/A" },
+    { key: "阶段数", value: formatCount(workflowData.summary.phaseCount) },
+    { key: "Agent 数", value: formatCount(workflowData.summary.agentCount) },
+    { key: "开始时间", value: formatDateTime(workflowData.summary.startedAt) },
+    { key: "结束时间", value: formatDateTime(workflowData.summary.endedAt) },
+    { key: "耗时", value: formatDuration(workflowData.summary.durationMs) },
+    { key: "总 Tokens", value: formatCount(workflowData.summary.totalTokens) },
+    { key: "总 Tool Calls", value: formatCount(workflowData.summary.totalToolCalls) },
+  ];
+
+  return (
+    <>
+      <section className="panel">
+        <h2>样本结论</h2>
+        <MetadataList items={summaryItems} />
+      </section>
+
+      <GuidePanel title="必要字段" items={workflowData.fieldGuide.essential} />
+      <GuidePanel
+        title="顺序与上下文"
+        items={workflowData.fieldGuide.ordering.concat(workflowData.fieldGuide.linkage)}
+      />
+      <GuidePanel title="Markdown 字段" items={workflowData.fieldGuide.markdown} />
+      <GuidePanel title="可忽略字段" items={workflowData.fieldGuide.ignored} />
+
+      <section className="panel">
+        <h2>阶段定义</h2>
+        {workflowData.phases.map((phase, index) => (
+          <div className="field-item" key={`${phase.title}-${index}`}>
+            <code>
+              phase {index + 1} · {phase.title}
+            </code>
+            <p>{phase.detail || "未提供阶段说明"}</p>
+          </div>
+        ))}
+      </section>
+
+      <section className="panel">
+        <h2>进度类型分布</h2>
+        <div className="pill-list">
+          {workflowData.summary.progressTypeCounts.map((item) => (
+            <span className="pill" key={item.type}>
+              {item.type}: {item.count}
+            </span>
+          ))}
+        </div>
+      </section>
+
+      {workflowData.errors.length > 0 ? (
+        <section className="panel">
+          <h2>解析错误</h2>
+          {workflowData.errors.map((item, index) => (
+            <div className="field-item" key={`${item.file}-${index}`}>
+              <code>{item.file}</code>
               <p>{item.error}</p>
             </div>
           ))}
@@ -289,6 +402,49 @@ function TimelineSection({
   );
 }
 
+function WorkflowProgressSection({
+  workflowData,
+  selectedType,
+  onSelectType,
+}) {
+  const filteredProgress = useMemo(() => {
+    if (selectedType === "all") {
+      return workflowData.progress;
+    }
+
+    return workflowData.progress.filter((record) => record.type === selectedType);
+  }, [selectedType, workflowData]);
+
+  return (
+    <>
+      <div className="content-toolbar">
+        <div>
+          <h2>Workflow 进度</h2>
+          <p>当前展示 {filteredProgress.length} / {workflowData.progress.length} 条 workflowProgress 记录</p>
+        </div>
+        <div className="tab-row">
+          {WORKFLOW_PROGRESS_TABS.map((tab) => (
+            <button
+              className={tab.value === selectedType ? "tab active" : "tab"}
+              key={tab.value}
+              onClick={() => onSelectType(tab.value)}
+              type="button"
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="timeline">
+        {filteredProgress.map((record) => (
+          <TimelineCard key={`${record.lineNumber}-${record.type}-${record.headline}`} record={record} />
+        ))}
+      </div>
+    </>
+  );
+}
+
 function MainSessionView({
   loading,
   error,
@@ -327,6 +483,103 @@ function MainSessionView({
 
           <section className="content">
             <TimelineSection sessionData={sessionData} selectedType={selectedType} onSelectType={onSelectType} />
+          </section>
+        </section>
+      ) : null}
+    </>
+  );
+}
+
+function WorkflowView({
+  loading,
+  error,
+  workflowData,
+  selectedType,
+  onSelectType,
+  onFileChange,
+}) {
+  return (
+    <>
+      <section className="hero">
+        <div className="hero-copy">
+          <p className="eyebrow">Workflow Viewer</p>
+          <h1>按 JSON 结构还原单次 Workflow 的阶段、脚本与结果</h1>
+          <p className="hero-text">
+            页面默认加载仓库里的 workflow 样本，也支持上传新的 <code>.json</code> 文件。展示时会把
+            <code>script</code> 按代码块渲染，把 <code>promptPreview</code>、
+            <code>resultPreview</code>、<code>result</code> 里的 Markdown 内容按正文方式展开。
+          </p>
+        </div>
+
+        <label className="upload-panel">
+          <span>载入新的 Workflow</span>
+          <input accept=".json,.txt" type="file" onChange={onFileChange} />
+        </label>
+      </section>
+
+      {loading ? <section className="panel status-panel">正在解析 Workflow JSON...</section> : null}
+      {error ? <section className="panel error-panel">{error}</section> : null}
+
+      {workflowData ? (
+        <section className="layout">
+          <aside className="sidebar">
+            <WorkflowPanels workflowData={workflowData} />
+          </aside>
+
+          <section className="content">
+            <section className="panel selected-session-hero">
+              <div className="selected-session-header">
+                <div>
+                  <p className="eyebrow">Selected Workflow</p>
+                  <h2>{workflowData.summary.title}</h2>
+                  <p className="selected-session-text">
+                    workflow 主顺序来自 <code>workflowProgress</code> 数组原始顺序，Agent 卡片上额外展示真实启动时间、
+                    所属阶段和结果摘要。
+                  </p>
+                </div>
+                <div className="pill-list">
+                  <span className="pill">status: {workflowData.summary.status || "N/A"}</span>
+                  <span className="pill">phases: {formatCount(workflowData.summary.phaseCount)}</span>
+                  <span className="pill">agents: {formatCount(workflowData.summary.agentCount)}</span>
+                </div>
+              </div>
+            </section>
+
+            {workflowData.summaryBlock ? (
+              <BlockPanel title="Workflow 摘要" blocks={[workflowData.summaryBlock]} emptyText="未提供摘要" />
+            ) : null}
+
+            <BlockPanel
+              title="Workflow Script"
+              blocks={workflowData.scriptBlock ? [workflowData.scriptBlock] : []}
+              emptyText="未提供 script 字段"
+            />
+
+            <BlockPanel
+              title="Workflow Logs"
+              blocks={workflowData.logBlocks}
+              emptyText="未提供 workflow 级日志"
+            />
+
+            <BlockPanel
+              title="Workflow Result"
+              blocks={workflowData.resultBlocks}
+              emptyText="未提供最终结果"
+            />
+
+            <WorkflowProgressSection
+              workflowData={workflowData}
+              selectedType={selectedType}
+              onSelectType={onSelectType}
+            />
+
+            <section className="panel metadata-panel">
+              <h2>原始 Workflow JSON</h2>
+              <details className="raw-json" open={false}>
+                <summary>展开查看完整 JSON</summary>
+                <pre className="code-block">{JSON.stringify(workflowData.data, null, 2)}</pre>
+              </details>
+            </section>
           </section>
         </section>
       ) : null}
@@ -527,6 +780,11 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  const [workflowData, setWorkflowData] = useState(null);
+  const [selectedWorkflowType, setSelectedWorkflowType] = useState("all");
+  const [workflowLoading, setWorkflowLoading] = useState(true);
+  const [workflowError, setWorkflowError] = useState("");
+
   const [subAgentData, setSubAgentData] = useState(null);
   const [selectedSubAgentKey, setSelectedSubAgentKey] = useState("");
   const [selectedSubAgentType, setSelectedSubAgentType] = useState("all");
@@ -566,6 +824,39 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+
+    async function loadDefaultWorkflow() {
+      try {
+        const response = await fetch(DEFAULT_WORKFLOW_URL);
+        const text = await response.text();
+
+        if (!active) {
+          return;
+        }
+
+        setWorkflowData(parseWorkflowText(text, "wf_5b655dd5-b9c.json"));
+      } catch (loadError) {
+        if (!active) {
+          return;
+        }
+
+        setWorkflowError(loadError instanceof Error ? loadError.message : "无法加载默认 workflow");
+      } finally {
+        if (active) {
+          setWorkflowLoading(false);
+        }
+      }
+    }
+
+    loadDefaultWorkflow();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const selectedSubAgentSession = useMemo(() => {
     if (!subAgentData) {
       return null;
@@ -592,10 +883,34 @@ function App() {
     try {
       const text = await file.text();
       setSessionData(parseSessionText(text, file.name));
+      setViewMode("session");
     } catch (fileError) {
       setError(fileError instanceof Error ? fileError.message : "文件读取失败");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleWorkflowFileChange(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    setWorkflowLoading(true);
+    setWorkflowError("");
+
+    try {
+      const text = await file.text();
+      setWorkflowData(parseWorkflowText(text, file.name));
+      setSelectedWorkflowType("all");
+      setViewMode("workflow");
+    } catch (fileError) {
+      setWorkflowError(fileError instanceof Error ? fileError.message : "文件读取失败");
+    } finally {
+      setWorkflowLoading(false);
     }
   }
 
@@ -612,9 +927,7 @@ function App() {
 
     try {
       const supportedFiles = files.filter(
-        (file) =>
-          /\.(jsonl|meta\.json)$/i.test(file.name) &&
-          !file.name.startsWith("."),
+        (file) => /\.(jsonl|meta\.json)$/i.test(file.name) && !file.name.startsWith("."),
       );
 
       const entries = await Promise.all(
@@ -667,7 +980,20 @@ function App() {
           selectedType={selectedType}
           sessionData={sessionData}
         />
-      ) : (
+      ) : null}
+
+      {viewMode === "workflow" ? (
+        <WorkflowView
+          error={workflowError}
+          loading={workflowLoading}
+          onFileChange={handleWorkflowFileChange}
+          onSelectType={setSelectedWorkflowType}
+          selectedType={selectedWorkflowType}
+          workflowData={workflowData}
+        />
+      ) : null}
+
+      {viewMode === "subagents" ? (
         <SubAgentDirectoryView
           directoryData={subAgentData}
           error={subAgentError}
@@ -678,7 +1004,7 @@ function App() {
           selectedSession={selectedSubAgentSession}
           selectedType={selectedSubAgentType}
         />
-      )}
+      ) : null}
     </main>
   );
 }

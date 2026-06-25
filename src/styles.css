@@ -389,6 +389,14 @@ pre {
   background: linear-gradient(180deg, rgba(250, 226, 221, 0.92), rgba(255, 252, 245, 0.92));
 }
 
+.timeline-workflow_phase {
+  background: linear-gradient(180deg, rgba(225, 239, 212, 0.94), rgba(255, 252, 245, 0.92));
+}
+
+.timeline-workflow_agent {
+  background: linear-gradient(180deg, rgba(222, 236, 250, 0.94), rgba(255, 252, 245, 0.92));
+}
+
 .timeline-topline {
   display: flex;
   justify-content: space-between;

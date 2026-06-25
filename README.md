@@ -1,8 +1,9 @@
 # Claude Code JSONL Viewer
 
-用于查看 Claude Code Session JSONL 的前端工具，支持两类输入：
+用于查看 Claude Code / workflow 执行记录的前端工具，支持三类输入：
 
 - 单个主 Session 的 `.jsonl` 文件
+- 单个 workflow 的 `.json` 文件
 - 含多个 Sub Agent Session 的目录，自动按 `journal.jsonl` 中的调用顺序组织展示
 
 当前项目是一个基于 Vite + React 的纯前端查看器，不依赖后端服务。
@@ -14,6 +15,13 @@
   - 支持上传新的 `.jsonl` 文件
   - 按时间线展示 `user`、`assistant`、`attachment`、`system`、`queue-operation`
   - 将 `mode`、`permission-mode`、`ai-title`、`last-prompt`、`file-history-snapshot` 等元数据单独归档
+
+- 单 Workflow 视图
+  - 默认加载仓库内样本 `wf_5b655dd5-b9c.json`
+  - 支持上传新的 `.json` 文件
+  - 展示 `script`、`phases`、`logs`、`result` 和 `workflowProgress`
+  - `script` 按代码块渲染，`promptPreview` / `resultPreview` / `result.results[]` 按 Markdown 渲染
+  - `workflowProgress` 不做列表聚合，直接按数组原始顺序展示单次 workflow 的阶段与 Agent 轨迹
 
 - Sub Agent 目录视图
   - 支持选择整个 `workflows` 目录，或单个 `wf_*` 目录
@@ -34,6 +42,8 @@
 - `uuid`：当前记录唯一标识
 - `parentUuid`：将消息、附件、工具结果串联为上下文树
 - `sessionId`：标识整个 Session
+- `runId` / `taskId`：标识单次 workflow 运行及其所属任务
+- `phaseIndex`：将 workflow 中的 Agent 执行记录挂回对应阶段
 
 ### 主要展示字段
 
@@ -43,6 +53,11 @@
 - `content`
 - `subtype`
 - `operation`
+- `script`
+- `phases`
+- `workflowProgress`
+- `logs`
+- `result`
 
 ### Markdown 渲染
 
@@ -56,6 +71,23 @@
 - `attachment.addedLines`
 
 工具调用、队列事件和原始记录则保留 code / JSON 视图，方便排查字段细节。
+
+workflow 页面里这些内容也会按 Markdown 展示：
+
+- `summary`
+- `workflowProgress[].promptPreview`
+- `workflowProgress[].resultPreview`
+- `logs[]`
+- `result.results[]`
+
+以下字段默认只作为辅助统计或保留在原始 JSON 中，不放进主正文流：
+
+- `defaultModel`
+- `workflowProgress[].model`
+- `workflowProgress[].fallbackModel`
+- `totalTokens`
+- `totalToolCalls`
+- `scriptPath`
 
 ## Sub Agent 目录结构
 

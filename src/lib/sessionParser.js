@@ -163,6 +163,41 @@ function toJsonBlock(label, value) {
   };
 }
 
+function toTextBlock(label, value, preferredMode = "plain") {
+  if (typeof value !== "string") {
+    return toJsonBlock(label, value);
+  }
+
+  if (preferredMode === "code") {
+    return {
+      label,
+      renderMode: "code",
+      text: value,
+    };
+  }
+
+  return {
+    label,
+    renderMode: pickRenderMode(value, preferredMode),
+    text: value,
+  };
+}
+
+function normalizeDateValue(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const normalized = new Date(value);
+    if (!Number.isNaN(normalized.getTime())) {
+      return normalized.toISOString();
+    }
+  }
+
+  return null;
+}
+
 function extractMessageBlocks(message) {
   if (!message) {
     return [];
@@ -470,6 +505,240 @@ function buildFieldGuide() {
   };
 }
 
+function buildWorkflowFieldGuide() {
+  return {
+    ordering: [
+      {
+        field: "workflowProgress[]",
+        purpose: "主顺序直接使用数组原始顺序，能够完整还原 workflow 阶段声明和 Agent 执行轨迹。",
+      },
+      {
+        field: "workflowProgress[].startedAt / queuedAt / lastProgressAt",
+        purpose: "Agent 记录的执行时间，用于补充展示真实启动和推进时间。",
+      },
+      {
+        field: "workflowProgress[].phaseIndex",
+        purpose: "把 workflow_agent 归属到对应阶段，避免只看 index 时丢失上下文。",
+      },
+    ],
+    linkage: [
+      {
+        field: "runId",
+        purpose: "当前 workflow 的唯一运行标识。",
+      },
+      {
+        field: "taskId",
+        purpose: "关联到所属任务。",
+      },
+      {
+        field: "workflowName / summary",
+        purpose: "提供 workflow 的可读标题和目标说明。",
+      },
+    ],
+    essential: [
+      {
+        field: "script",
+        purpose: "workflow 脚本正文，是理解执行意图和阶段设计的核心字段。",
+      },
+      {
+        field: "phases",
+        purpose: "定义 workflow 的阶段标题与说明。",
+      },
+      {
+        field: "workflowProgress",
+        purpose: "记录每个阶段和每个 Agent 的执行情况，是主要内容区。",
+      },
+      {
+        field: "logs",
+        purpose: "补充 workflow 级别的过程日志。",
+      },
+      {
+        field: "result",
+        purpose: "workflow 完成后的最终产出，需要按 Markdown / 结构化内容展示。",
+      },
+      {
+        field: "status / durationMs / startTime / timestamp",
+        purpose: "展示 workflow 执行状态、开始结束时间与耗时。",
+      },
+    ],
+    markdown: [
+      {
+        field: "summary",
+        purpose: "workflow 摘要通常是自然语言说明，按 Markdown 展示可兼容列表和强调。",
+      },
+      {
+        field: "workflowProgress[].promptPreview",
+        purpose: "子 Agent 的任务提示通常本身就是 Markdown 结构。",
+      },
+      {
+        field: "workflowProgress[].resultPreview",
+        purpose: "子 Agent 的结果摘要经常包含列表、标题、代码片段。",
+      },
+      {
+        field: "result.results[] / logs[]",
+        purpose: "最终结果和日志多为自然语言片段，需要保留 Markdown 格式。",
+      },
+    ],
+    ignored: [
+      {
+        field: "defaultModel / workflowProgress[].model / fallbackModel",
+        purpose: "模型选择不是这次 workflow 内容展示的重点，保留在原始 JSON 里排查即可。",
+      },
+      {
+        field: "totalTokens / totalToolCalls / workflowProgress[].tokens / toolCalls",
+        purpose: "这些字段更适合做统计辅助，不应挤占正文区域。",
+      },
+      {
+        field: "scriptPath",
+        purpose: "主要用于定位磁盘文件路径，默认不放到主阅读流中。",
+      },
+    ],
+  };
+}
+
+function buildWorkflowProgressHeadline(item) {
+  if (item.type === "workflow_phase") {
+    return `phase.${item.index || "?"} ${item.title || "Untitled"}`;
+  }
+
+  if (item.type === "workflow_agent") {
+    return item.label || `agent.${item.index || "?"}`;
+  }
+
+  return item.type || "workflow-event";
+}
+
+function extractWorkflowResultBlocks(result) {
+  if (result === null || result === undefined) {
+    return [];
+  }
+
+  if (typeof result === "string") {
+    return [toTextBlock("result", result, "markdown")];
+  }
+
+  if (Array.isArray(result)) {
+    return result.flatMap((item, index) => {
+      if (typeof item === "string") {
+        return [toTextBlock(`result[${index}]`, item, "markdown")];
+      }
+
+      return [toJsonBlock(`result[${index}]`, item)];
+    });
+  }
+
+  if (typeof result !== "object") {
+    return [
+      {
+        label: "result",
+        renderMode: "plain",
+        text: String(result),
+      },
+    ];
+  }
+
+  const blocks = [];
+  const scalarEntries = Object.entries(result).filter(([, value]) => {
+    if (value === null || value === undefined) {
+      return false;
+    }
+
+    if (Array.isArray(value)) {
+      return false;
+    }
+
+    return typeof value !== "object";
+  });
+
+  if (scalarEntries.length > 0) {
+    blocks.push({
+      label: "result.summary",
+      renderMode: "plain",
+      text: scalarEntries.map(([key, value]) => `${key}: ${value}`).join("\n"),
+    });
+  }
+
+  Object.entries(result).forEach(([key, value]) => {
+    if (value === null || value === undefined) {
+      return;
+    }
+
+    if (scalarEntries.some(([scalarKey]) => scalarKey === key)) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        if (typeof item === "string") {
+          blocks.push(toTextBlock(`${key}[${index}]`, item, "markdown"));
+          return;
+        }
+
+        blocks.push(toJsonBlock(`${key}[${index}]`, item));
+      });
+      return;
+    }
+
+    if (typeof value === "string") {
+      blocks.push(toTextBlock(key, value, "markdown"));
+      return;
+    }
+
+    blocks.push(toJsonBlock(key, value));
+  });
+
+  return blocks;
+}
+
+function extractWorkflowProgressBlocks(item, phaseByIndex) {
+  if (!item || typeof item !== "object") {
+    return [];
+  }
+
+  if (item.type === "workflow_phase") {
+    const matchedPhase = phaseByIndex.get(item.index);
+    const text = matchedPhase?.detail || item.detail || "";
+
+    return text ? [toTextBlock("phase.detail", text, "markdown")] : [];
+  }
+
+  if (item.type === "workflow_agent") {
+    const blocks = [];
+    const summary = summarizeObject({
+      phase: item.phaseTitle || phaseByIndex.get(item.phaseIndex)?.title,
+      state: item.state,
+      agentId: item.agentId,
+      attempt: item.attempt,
+      durationMs: item.durationMs,
+      lastToolName: item.lastToolName,
+    });
+
+    if (summary.length > 0) {
+      blocks.push({
+        label: "agent.summary",
+        renderMode: "plain",
+        text: summary.map((entry) => `${entry.key}: ${entry.value}`).join("\n"),
+      });
+    }
+
+    if (item.promptPreview) {
+      blocks.push(toTextBlock("agent.promptPreview", item.promptPreview, "markdown"));
+    }
+
+    if (item.resultPreview) {
+      blocks.push(toTextBlock("agent.resultPreview", item.resultPreview, "markdown"));
+    }
+
+    if (item.lastToolSummary) {
+      blocks.push(toTextBlock("agent.lastToolSummary", item.lastToolSummary, "plain"));
+    }
+
+    return blocks;
+  }
+
+  return [toJsonBlock(item.type || "workflowProgress", item)];
+}
+
 function toSessionRecords(parsedLines) {
   const errors = parsedLines
     .filter((entry) => entry.error)
@@ -600,6 +869,112 @@ export function parseJournalText(sourceText, sourceName = "journal.jsonl") {
     records,
     errors,
     summary: buildJournalSummary(records),
+  };
+}
+
+export function parseWorkflowText(sourceText, sourceName = "workflow.json") {
+  const parsed = parseJsonObjectText(sourceText, sourceName);
+
+  if (parsed.error) {
+    return {
+      sourceName,
+      data: null,
+      errors: [
+        {
+          scope: "workflow",
+          file: sourceName,
+          error: parsed.error,
+        },
+      ],
+      progress: [],
+      phases: [],
+      logs: [],
+      logBlocks: [],
+      resultBlocks: [],
+      scriptBlock: null,
+      summaryBlock: null,
+      summary: {
+        title: sourceName.replace(/\.json$/i, ""),
+        runId: null,
+        taskId: null,
+        status: null,
+        recordCount: 0,
+        phaseCount: 0,
+        agentCount: 0,
+        startedAt: null,
+        endedAt: null,
+        durationMs: null,
+        totalTokens: null,
+        totalToolCalls: null,
+        progressTypeCounts: [],
+      },
+      fieldGuide: buildWorkflowFieldGuide(),
+    };
+  }
+
+  const data = parsed.data;
+  const phases = Array.isArray(data?.phases) ? data.phases : [];
+  const logs = Array.isArray(data?.logs) ? data.logs : [];
+  const progressItems = Array.isArray(data?.workflowProgress) ? data.workflowProgress : [];
+  const phaseByIndex = new Map(
+    phases.map((phase, index) => [phase.index || index + 1, phase]),
+  );
+
+  const progress = progressItems.map((item, index) => ({
+    ...item,
+    lineNumber: index + 1,
+    timestamp: normalizeDateValue(item.startedAt || item.queuedAt || item.lastProgressAt),
+    headline: buildWorkflowProgressHeadline(item),
+    blocks: extractWorkflowProgressBlocks(item, phaseByIndex),
+    contextLabel:
+      item.type === "workflow_agent"
+        ? `phase ${item.phaseIndex || "?"}${item.phaseTitle ? ` · ${item.phaseTitle}` : ""}`
+        : `step ${index + 1}`,
+  }));
+
+  const resultBlocks = extractWorkflowResultBlocks(data?.result);
+  const logBlocks = logs.map((item, index) => toTextBlock(`logs[${index}]`, item, "markdown"));
+  const scriptBlock = data?.script ? toTextBlock("script", data.script, "code") : null;
+  const summaryBlock = data?.summary ? toTextBlock("summary", data.summary, "markdown") : null;
+  const startedAt = normalizeDateValue(data?.startTime);
+  const endedAt =
+    normalizeDateValue(data?.timestamp) ||
+    normalizeDateValue(
+      typeof data?.startTime === "number" && typeof data?.durationMs === "number"
+        ? data.startTime + data.durationMs
+        : null,
+    );
+
+  return {
+    sourceName,
+    data,
+    errors: [],
+    progress,
+    phases,
+    logs,
+    logBlocks,
+    resultBlocks,
+    scriptBlock,
+    summaryBlock,
+    summary: {
+      title: data?.workflowName || data?.summary || sourceName.replace(/\.json$/i, ""),
+      runId: data?.runId || null,
+      taskId: data?.taskId || null,
+      status: data?.status || null,
+      recordCount: progress.length,
+      phaseCount: phases.length,
+      agentCount:
+        typeof data?.agentCount === "number"
+          ? data.agentCount
+          : progress.filter((item) => item.type === "workflow_agent").length,
+      startedAt,
+      endedAt,
+      durationMs: typeof data?.durationMs === "number" ? data.durationMs : null,
+      totalTokens: typeof data?.totalTokens === "number" ? data.totalTokens : null,
+      totalToolCalls: typeof data?.totalToolCalls === "number" ? data.totalToolCalls : null,
+      progressTypeCounts: formatTypeCounts(progress),
+    },
+    fieldGuide: buildWorkflowFieldGuide(),
   };
 }
 
