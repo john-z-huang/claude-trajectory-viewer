@@ -204,6 +204,8 @@ pre {
   gap: 18px;
   padding-bottom: 10px;
   border-bottom: 1px solid rgba(74, 58, 39, 0.1);
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .key-value-row:last-child {
@@ -213,11 +215,19 @@ pre {
 
 .key-value-row span {
   color: var(--muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.key-value-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .field-item {
   padding: 14px 0;
   border-bottom: 1px solid rgba(74, 58, 39, 0.1);
+  min-width: 0;
 }
 
 .field-item:last-child {
@@ -231,12 +241,16 @@ pre {
   padding: 0.15rem 0.45rem;
   border-radius: 999px;
   background: rgba(47, 36, 24, 0.08);
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .field-item p {
   margin: 0;
   line-height: 1.6;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .pill-list {
@@ -260,6 +274,7 @@ pre {
 }
 
 .session-nav-card {
+  display: block;
   width: 100%;
   padding: 16px;
   border: 1px solid rgba(74, 58, 39, 0.12);
@@ -292,18 +307,30 @@ pre {
   gap: 12px;
   color: var(--muted);
   font-size: 0.88rem;
+  min-width: 0;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-nav-topline > *,
+.session-nav-meta > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .session-nav-title {
   margin: 10px 0 8px;
   font-weight: 800;
   overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .session-nav-card p {
   margin: 10px 0 0;
   color: var(--muted);
   line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .content-toolbar {

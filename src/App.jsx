@@ -88,11 +88,32 @@ function formatDuration(value) {
 }
 
 function buildResultPreview(value) {
-  if (!value) {
+  if (value === null || value === undefined || value === "") {
     return "尚未发现返回结果";
   }
 
-  const firstLine = value
+  if (typeof value === "object") {
+    if (Array.isArray(value)) {
+      return buildResultPreview(value.map((item) => buildResultPreview(item)).join("\n"));
+    }
+
+    const preferredValue =
+      value.summary ??
+      value.title ??
+      value.result ??
+      value.text ??
+      value.content ??
+      value.message ??
+      value.description;
+
+    if (preferredValue !== undefined && preferredValue !== null) {
+      return buildResultPreview(preferredValue);
+    }
+
+    return buildResultPreview(JSON.stringify(value));
+  }
+
+  const firstLine = String(value)
     .split("\n")
     .map((line) => line.trim())
     .find(Boolean);
