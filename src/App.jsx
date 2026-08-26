@@ -1,18 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  parseSessionText,
-  parseSubAgentDirectory,
-  parseWorkflowText,
-} from "./lib/sessionParser";
+  collectClaudeCodeDirectoryEntries,
+  collectClaudeCodeDirectoryUploadEntries,
+  parseClaudeCodeDirectory,
+  parseClaudeCodeSessionJsonl,
+  parseClaudeCodeWorkflowJson,
+} from "./lib/claudeCode/index.js";
 
 const DEFAULT_SESSION_URL = new URL(
   "../8ab6ca2d-ece3-4e1f-8b10-beba29afd2d8.jsonl",
   import.meta.url,
 ).href;
-
-const DEFAULT_WORKFLOW_URL = new URL("../wf_5b655dd5-b9c.json", import.meta.url).href;
 
 const TYPE_TABS = [
   { value: "all", label: "全部" },
@@ -30,10 +30,19 @@ const WORKFLOW_PROGRESS_TABS = [
 ];
 
 const VIEW_TABS = [
+  { value: "subagents", label: "Workflow 目录" },
   { value: "session", label: "单 Session" },
   { value: "workflow", label: "单 Workflow" },
-  { value: "subagents", label: "Sub Agent 目录" },
 ];
+
+function buildTypeTabs(typeCounts, baseTabs) {
+  const knownTypes = new Set(baseTabs.map((tab) => tab.value));
+  const extraTabs = typeCounts
+    .filter((item) => !knownTypes.has(item.type))
+    .map((item) => ({ value: item.type, label: item.type }));
+
+  return baseTabs.concat(extraTabs);
+}
 
 function formatDateTime(value) {
   if (!value) {
@@ -41,6 +50,10 @@ function formatDateTime(value) {
   }
 
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "N/A";
+  }
+
   return new Intl.DateTimeFormat("zh-CN", {
     dateStyle: "medium",
     timeStyle: "medium",
@@ -53,6 +66,10 @@ function formatCompactDateTime(value) {
   }
 
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "未找到时间";
+  }
+
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
@@ -247,6 +264,8 @@ function SessionPanels({ sessionData, extraPanels = [] }) {
     { key: "元数据记录", value: formatCount(sessionData.summary.metadataCount) },
     { key: "开始时间", value: formatDateTime(sessionData.summary.startedAt) },
     { key: "结束时间", value: formatDateTime(sessionData.summary.endedAt) },
+    { key: "总费用 (USD)", value: sessionData.summary.costUSD ?? "N/A" },
+    { key: "累计耗时", value: formatDuration(sessionData.summary.totalDurationMs) },
   ];
 
   return (
@@ -382,7 +401,7 @@ function TimelineSection({
           <p>{subtitle || `当前展示 ${filteredTimeline.length} / ${sessionData.timeline.length} 条可排序记录`}</p>
         </div>
         <div className="tab-row">
-          {TYPE_TABS.map((tab) => (
+          {buildTypeTabs(sessionData.summary.timelineTypeCounts, TYPE_TABS).map((tab) => (
             <button
               className={tab.value === selectedType ? "tab active" : "tab"}
               key={tab.value}
@@ -403,21 +422,16 @@ function TimelineSection({
 
       <section className="panel metadata-panel">
         <h2>非时间线元数据</h2>
-        <pre className="code-block">
-          {JSON.stringify(
-            sessionData.metadata.map((item) => ({
-              type: item.type,
-              lineNumber: item.lineNumber,
-              sessionId: item.sessionId,
-              mode: item.mode,
-              permissionMode: item.permissionMode,
-              aiTitle: item.aiTitle,
-              lastPrompt: item.lastPrompt,
-            })),
-            null,
-            2,
-          )}
-        </pre>
+        <details className="raw-json">
+          <summary>展开查看 {sessionData.metadata.length} 条元数据</summary>
+          <pre className="code-block">
+            {JSON.stringify(
+              sessionData.metadata.map(({ raw, isTimelineRecord, isMetaRecord, ...item }) => item),
+              null,
+              2,
+            )}
+          </pre>
+        </details>
       </section>
     </>
   );
@@ -444,7 +458,7 @@ function WorkflowProgressSection({
           <p>当前展示 {filteredProgress.length} / {workflowData.progress.length} 条 workflowProgress 记录</p>
         </div>
         <div className="tab-row">
-          {WORKFLOW_PROGRESS_TABS.map((tab) => (
+          {buildTypeTabs(workflowData.summary.progressTypeCounts, WORKFLOW_PROGRESS_TABS).map((tab) => (
             <button
               className={tab.value === selectedType ? "tab active" : "tab"}
               key={tab.value}
@@ -462,6 +476,92 @@ function WorkflowProgressSection({
           <TimelineCard key={`${record.lineNumber}-${record.type}-${record.headline}`} record={record} />
         ))}
       </div>
+    </>
+  );
+}
+
+function getParsedFileKindLabel(parsedFile) {
+  const labels = {
+    "agent-session": "Sub Agent Session",
+    journal: "journal",
+    json: "普通 JSON",
+    meta: "元配置 JSON",
+    session: "Session",
+    workflow: "Workflow 描述",
+  };
+
+  return labels[parsedFile.kind] || parsedFile.kind;
+}
+
+function getParsedFileDisplayValue(parsedFile) {
+  const result = parsedFile.result;
+
+  if (parsedFile.parser === "json" || parsedFile.parser === "workflow") {
+    return result?.data ?? null;
+  }
+
+  return {
+    summary: result?.summary || {},
+    errors: result?.errors || [],
+    records: (result?.records || []).map(({ raw, ...record }) => record),
+  };
+}
+
+function ParsedDirectoryFileView({ parsedFile }) {
+  const result = parsedFile.result;
+  const summaryItems = [
+    { key: "类型", value: getParsedFileKindLabel(parsedFile) },
+    { key: "格式", value: parsedFile.format.toUpperCase() },
+    { key: "解析器", value: parsedFile.parser },
+    { key: "错误", value: formatCount(parsedFile.errors.length) },
+  ];
+
+  if (typeof result?.summary?.recordCount === "number") {
+    summaryItems.push({ key: "记录数", value: formatCount(result.summary.recordCount) });
+  }
+
+  return (
+    <>
+      <section className="panel selected-session-hero">
+        <div className="selected-session-header">
+          <div>
+            <p className="eyebrow">Parsed Directory File</p>
+            <h2>{parsedFile.relativePath}</h2>
+            <p className="selected-session-text">
+              该文件来自当前 Workflow 目录扫描，展示的是独立于 UI 的解析结果。
+            </p>
+          </div>
+          <div className="pill-list">
+            <span className="pill">{getParsedFileKindLabel(parsedFile)}</span>
+            <span className="pill">{parsedFile.format.toUpperCase()}</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>文件概览</h2>
+        <MetadataList items={summaryItems} />
+      </section>
+
+      {parsedFile.errors.length > 0 ? (
+        <section className="panel">
+          <h2>解析错误</h2>
+          {parsedFile.errors.map((item, index) => (
+            <div className="field-item" key={`${parsedFile.key}-${index}`}>
+              <code>{item.file || parsedFile.relativePath}</code>
+              <p>{item.error}</p>
+            </div>
+          ))}
+        </section>
+      ) : null}
+
+      <section className="panel">
+        <h2>解析后的内容</h2>
+        <details className="raw-json" open>
+          <summary>展开查看结构化结果</summary>
+          <pre className="code-block">{JSON.stringify(getParsedFileDisplayValue(parsedFile), null, 2)}</pre>
+        </details>
+      </section>
     </>
   );
 }
@@ -526,8 +626,8 @@ function WorkflowView({
           <p className="eyebrow">Workflow Viewer</p>
           <h1>按 JSON 结构还原单次 Workflow 的阶段、脚本与结果</h1>
           <p className="hero-text">
-            页面默认加载仓库里的 workflow 样本，也支持上传新的 <code>.json</code> 文件。展示时会把
-            <code>script</code> 按代码块渲染，把 <code>promptPreview</code>、
+            可直接上传单个 <code>.json</code> 文件。展示时会把 <code>script</code> 按代码块渲染，把
+            <code>promptPreview</code>、
             <code>resultPreview</code>、<code>result</code> 里的 Markdown 内容按正文方式展开。
           </p>
         </div>
@@ -612,38 +712,65 @@ function SubAgentDirectoryView({
   loading,
   error,
   directoryData,
+  directorySource,
+  directoryInputRef,
   selectedSession,
+  selectedParsedFile,
   selectedType,
   onSelectType,
   onSelectSession,
+  onSelectParsedFile,
   onDirectoryChange,
+  onSelectWorkflowDirectory,
+  onOpenMainSession,
+  onOpenWorkflow,
 }) {
   return (
     <>
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">Sub Agent Directory Viewer</p>
-          <h1>按 `journal.jsonl` 顺序浏览多个 Sub Agent Session</h1>
-          <p className="hero-text">
-            目录上传后会自动识别 <code>journal.jsonl</code>、<code>agent-*.jsonl</code> 和
-            <code>*.meta.json</code>，用 journal 里的启动顺序作为主序，再回填每个 Sub Agent 的启动时间。
+          <p className="eyebrow">Dynamic Workflow Directory Viewer</p>
+          <h1>读取一个 Workflow 目录，浏览所有 JSON 与 JSONL</h1>
+         <p className="hero-text">
+            选择本机 Workflow 目录后，页面会递归读取该目录及其子目录内的全部
+            <code>.json</code> 与 <code>.jsonl</code> 文件。<code>wf_*.json</code> 仅在存在时作为
+            Workflow 描述增强展示，不再是目录解析的前提。
+         </p>
+       </div>
+
+        <div className="directory-load-actions">
+          <button
+            className="directory-picker-button"
+            disabled={loading}
+            onClick={onSelectWorkflowDirectory}
+            type="button"
+          >
+            {loading ? "正在读取目录..." : "选择 Workflow 目录"}
+          </button>
+          <p>
+            浏览器会请求读取所选目录的权限，并只在本机递归解析其中的 <code>.json</code> 与
+            <code>.jsonl</code> 文件。
           </p>
+          <input
+            aria-label="选择 Workflow 目录"
+            className="directory-file-input"
+            directory=""
+            multiple
+            onChange={onDirectoryChange}
+            ref={directoryInputRef}
+            type="file"
+            webkitdirectory=""
+          />
         </div>
+     </section>
 
-        <label className="upload-panel">
-          <span>载入 Sub Agent 目录</span>
-          <input directory="" multiple type="file" webkitdirectory="" onChange={onDirectoryChange} />
-        </label>
-      </section>
-
-      {loading ? <section className="panel status-panel">正在解析目录中的 Sub Agent Session...</section> : null}
+      {loading ? <section className="panel status-panel">正在解析 Session 目录...</section> : null}
       {error ? <section className="panel error-panel">{error}</section> : null}
 
       {!loading && !error && !directoryData ? (
-        <section className="panel empty-panel">
-          请选择包含 `journal.jsonl`、`agent-*.jsonl`、`*.meta.json` 的目录。支持直接选择 `workflows`
-          目录，也支持选择某个单独的 `wf_*` 工作流目录。
-        </section>
+       <section className="panel empty-panel">
+          点击“选择 Workflow 目录”并在系统选择器中选取目录。系统会递归解析其中所有 `.json` 和 `.jsonl` 文件。
+       </section>
       ) : null}
 
       {directoryData ? (
@@ -652,16 +779,80 @@ function SubAgentDirectoryView({
             <section className="panel">
               <h2>目录概览</h2>
               <MetadataList
-                items={[
-                  { key: "目录", value: directoryData.rootName },
-                  { key: "工作流数", value: formatCount(directoryData.summary.workflowCount) },
-                  { key: "会话数", value: formatCount(directoryData.summary.sessionCount) },
-                  { key: "journal 数", value: formatCount(directoryData.summary.journalCount) },
-                  { key: "警告", value: formatCount(directoryData.summary.warningCount) },
-                  { key: "错误", value: formatCount(directoryData.summary.errorCount) },
-                ]}
+               items={[
+                  { key: "所选目录", value: directorySource?.directoryName || "未选择" },
+                 { key: "目录", value: directoryData.rootName },
+                  { key: "已解析文件", value: formatCount(directoryData.summary.parsedFileCount) },
+                  { key: "JSON 文件", value: formatCount(directoryData.summary.jsonFileCount) },
+                  { key: "JSONL 文件", value: formatCount(directoryData.summary.jsonlFileCount) },
+                 { key: "工作流数", value: formatCount(directoryData.summary.workflowCount) },
+                 { key: "会话数", value: formatCount(directoryData.summary.sessionCount) },
+                 { key: "主 Session 数", value: formatCount(directoryData.summary.mainSessionCount) },
+                  { key: "Workflow 描述数", value: formatCount(directoryData.summary.workflowFileCount) },
+                 { key: "journal 数", value: formatCount(directoryData.summary.journalCount) },
+                  { key: "跳过文件", value: formatCount(directorySource?.skippedFiles?.length || 0) },
+                 { key: "警告", value: formatCount(directoryData.summary.warningCount) },
+                 { key: "错误", value: formatCount(directoryData.summary.errorCount) },
+               ]}
               />
             </section>
+
+            <section className="panel">
+              <h2>全部解析文件</h2>
+              <p className="directory-file-note">
+                目录中每个 JSON / JSONL 均可点击查看解析结果；命名不符合旧 workflow 规则的 JSON 也会保留。
+              </p>
+              <div className="session-nav-list directory-file-list">
+                {directoryData.parsedFiles.map((parsedFile) => (
+                  <button
+                    className={
+                      selectedParsedFile?.key === parsedFile.key
+                        ? "session-nav-card active"
+                        : "session-nav-card"
+                    }
+                    key={parsedFile.key}
+                    onClick={() => onSelectParsedFile(parsedFile.key)}
+                    type="button"
+                  >
+                    <div className="session-nav-topline">
+                      <strong>{parsedFile.format.toUpperCase()}</strong>
+                      <span>{getParsedFileKindLabel(parsedFile)}</span>
+                    </div>
+                    <div className="session-nav-title">{parsedFile.relativePath}</div>
+                    <div className="session-nav-meta">
+                      <span>parser: {parsedFile.parser}</span>
+                      <span>{parsedFile.errors.length} 个错误</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            {directoryData.mainSessions.length > 0 ? (
+              <section className="panel">
+                <h2>主 Session</h2>
+                <div className="session-nav-list">
+                  {directoryData.mainSessions.map((entry) => (
+                    <button
+                      className="session-nav-card"
+                      key={entry.key}
+                      onClick={() => onOpenMainSession(entry)}
+                      type="button"
+                    >
+                      <div className="session-nav-topline">
+                        <strong>主 Agent</strong>
+                        <span>{formatCount(entry.sessionData.summary.recordCount)} 条记录</span>
+                      </div>
+                      <div className="session-nav-title">{entry.sourceName}</div>
+                      <div className="session-nav-meta">
+                        <span>{formatCompactDateTime(entry.sessionData.summary.startedAt)}</span>
+                        <span>{entry.sessionData.summary.sessionId || "unknown session"}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
 
             <section className="panel">
               <h2>工作流</h2>
@@ -672,6 +863,15 @@ function SubAgentDirectoryView({
                     {workflow.summary.sessionCount} 个 Session，started {workflow.summary.startedCount}，result{" "}
                     {workflow.summary.resultCount}
                   </p>
+                  {workflow.workflowData ? (
+                    <button
+                      className="tab"
+                      onClick={() => onOpenWorkflow(workflow.workflowData)}
+                      type="button"
+                    >
+                      打开 Workflow
+                    </button>
+                  ) : null}
                 </div>
               ))}
             </section>
@@ -683,7 +883,10 @@ function SubAgentDirectoryView({
                   <button
                     className={selectedSession?.key === entry.key ? "session-nav-card active" : "session-nav-card"}
                     key={entry.key}
-                    onClick={() => onSelectSession(entry.key)}
+                    onClick={() => {
+                      onSelectSession(entry.key);
+                      onSelectParsedFile("");
+                    }}
                     type="button"
                   >
                     <div className="session-nav-topline">
@@ -714,10 +917,24 @@ function SubAgentDirectoryView({
                 )}
               </section>
             ) : null}
+
+            {directoryData.errors.length > 0 ? (
+              <section className="panel">
+                <h2>目录解析错误</h2>
+                {directoryData.errors.map((item, index) => (
+                  <div className="field-item" key={`${item.file}-${index}`}>
+                    <code>{item.file}</code>
+                    <p>{item.error}</p>
+                  </div>
+                ))}
+              </section>
+            ) : null}
           </aside>
 
           <section className="content">
-            {selectedSession ? (
+            {selectedParsedFile ? (
+              <ParsedDirectoryFileView parsedFile={selectedParsedFile} />
+            ) : selectedSession ? (
               <>
                 <section className="panel selected-session-hero">
                   <div className="selected-session-header">
@@ -766,11 +983,19 @@ function SubAgentDirectoryView({
                       </section>,
                       <section className="panel" key="subagent-result">
                         <h2>journal 返回结果</h2>
-                        <div className="markdown-body">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {selectedSession.journalResultRecord?.result || "尚未在 journal.jsonl 中发现 result 记录。"}
-                          </ReactMarkdown>
-                        </div>
+                        {typeof selectedSession.journalResultRecord?.result === "string" ? (
+                          <div className="markdown-body">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {selectedSession.journalResultRecord.result}
+                            </ReactMarkdown>
+                          </div>
+                        ) : selectedSession.journalResultRecord?.result ? (
+                          <pre className="code-block">
+                            {JSON.stringify(selectedSession.journalResultRecord.result, null, 2)}
+                          </pre>
+                        ) : (
+                          <div className="timeline-empty">尚未在 journal.jsonl 中发现 result 记录。</div>
+                        )}
                       </section>,
                     ]}
                   />
@@ -784,8 +1009,13 @@ function SubAgentDirectoryView({
                   subtitle={`当前展示 ${selectedSession.sessionData.timeline.length} 条可排序记录，展示规则与主 Agent 保持一致`}
                 />
               </>
+            ) : directoryData.mainSessions.length > 0 ? (
+              <section className="panel empty-panel">
+                目录中已找到主 Session，请从左侧打开；如需查看 Sub Agent，请确认选择范围包含
+                <code>subagents/workflows</code>。
+              </section>
             ) : (
-              <section className="panel empty-panel">目录中没有可用的 Sub Agent Session。</section>
+              <section className="panel empty-panel">目录中没有可用的 Session。</section>
             )}
           </section>
         </section>
@@ -795,7 +1025,7 @@ function SubAgentDirectoryView({
 }
 
 function App() {
-  const [viewMode, setViewMode] = useState("session");
+  const [viewMode, setViewMode] = useState("subagents");
   const [sessionData, setSessionData] = useState(null);
   const [selectedType, setSelectedType] = useState("all");
   const [loading, setLoading] = useState(true);
@@ -803,11 +1033,14 @@ function App() {
 
   const [workflowData, setWorkflowData] = useState(null);
   const [selectedWorkflowType, setSelectedWorkflowType] = useState("all");
-  const [workflowLoading, setWorkflowLoading] = useState(true);
+  const [workflowLoading, setWorkflowLoading] = useState(false);
   const [workflowError, setWorkflowError] = useState("");
 
   const [subAgentData, setSubAgentData] = useState(null);
+  const [directorySource, setDirectorySource] = useState(null);
+  const workflowDirectoryInputRef = useRef(null);
   const [selectedSubAgentKey, setSelectedSubAgentKey] = useState("");
+  const [selectedParsedFileKey, setSelectedParsedFileKey] = useState("");
   const [selectedSubAgentType, setSelectedSubAgentType] = useState("all");
   const [subAgentLoading, setSubAgentLoading] = useState(false);
   const [subAgentError, setSubAgentError] = useState("");
@@ -824,7 +1057,9 @@ function App() {
           return;
         }
 
-        setSessionData(parseSessionText(text, "8ab6ca2d-ece3-4e1f-8b10-beba29afd2d8.jsonl"));
+        setSessionData(
+          parseClaudeCodeSessionJsonl(text, "8ab6ca2d-ece3-4e1f-8b10-beba29afd2d8.jsonl"),
+        );
       } catch (loadError) {
         if (!active) {
           return;
@@ -845,39 +1080,6 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    let active = true;
-
-    async function loadDefaultWorkflow() {
-      try {
-        const response = await fetch(DEFAULT_WORKFLOW_URL);
-        const text = await response.text();
-
-        if (!active) {
-          return;
-        }
-
-        setWorkflowData(parseWorkflowText(text, "wf_5b655dd5-b9c.json"));
-      } catch (loadError) {
-        if (!active) {
-          return;
-        }
-
-        setWorkflowError(loadError instanceof Error ? loadError.message : "无法加载默认 workflow");
-      } finally {
-        if (active) {
-          setWorkflowLoading(false);
-        }
-      }
-    }
-
-    loadDefaultWorkflow();
-
-    return () => {
-      active = false;
-    };
-  }, []);
-
   const selectedSubAgentSession = useMemo(() => {
     if (!subAgentData) {
       return null;
@@ -889,6 +1091,54 @@ function App() {
       null
     );
   }, [selectedSubAgentKey, subAgentData]);
+
+  const selectedParsedFile = useMemo(() => {
+    if (!subAgentData || !selectedParsedFileKey) {
+      return null;
+    }
+
+    return subAgentData.parsedFiles.find((entry) => entry.key === selectedParsedFileKey) || null;
+  }, [selectedParsedFileKey, subAgentData]);
+
+  function applyDirectoryEntries(entries, source) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error("该目录及其子目录中没有可解析的 JSON 或 JSONL 文件。");
+    }
+
+    const parsedDirectory = parseClaudeCodeDirectory(entries);
+    setSubAgentData(parsedDirectory);
+    setDirectorySource(source);
+    setSelectedParsedFileKey("");
+    setSelectedSubAgentKey(parsedDirectory.orderedSessions[0]?.key || "");
+    setSelectedSubAgentType("all");
+    setViewMode("subagents");
+  }
+
+  async function handleWorkflowDirectorySelect() {
+    if (typeof window.showDirectoryPicker !== "function") {
+      workflowDirectoryInputRef.current?.click();
+      return;
+    }
+
+    setSubAgentLoading(true);
+    setSubAgentError("");
+
+    try {
+      const directoryHandle = await window.showDirectoryPicker({ mode: "read" });
+      const loadedDirectory = await collectClaudeCodeDirectoryEntries(directoryHandle);
+
+      applyDirectoryEntries(loadedDirectory.entries, {
+        directoryName: loadedDirectory.rootName,
+        skippedFiles: loadedDirectory.skippedFiles,
+      });
+    } catch (directoryError) {
+      if (directoryError?.name !== "AbortError") {
+        setSubAgentError(directoryError instanceof Error ? directoryError.message : "目录读取失败");
+      }
+    } finally {
+      setSubAgentLoading(false);
+    }
+  }
 
   async function handleFileChange(event) {
     const file = event.target.files?.[0];
@@ -903,7 +1153,7 @@ function App() {
 
     try {
       const text = await file.text();
-      setSessionData(parseSessionText(text, file.name));
+      setSessionData(parseClaudeCodeSessionJsonl(text, file.name));
       setViewMode("session");
     } catch (fileError) {
       setError(fileError instanceof Error ? fileError.message : "文件读取失败");
@@ -925,7 +1175,7 @@ function App() {
 
     try {
       const text = await file.text();
-      setWorkflowData(parseWorkflowText(text, file.name));
+      setWorkflowData(parseClaudeCodeWorkflowJson(text, file.name));
       setSelectedWorkflowType("all");
       setViewMode("workflow");
     } catch (fileError) {
@@ -947,23 +1197,12 @@ function App() {
     setSubAgentError("");
 
     try {
-      const supportedFiles = files.filter(
-        (file) => /\.(jsonl|meta\.json)$/i.test(file.name) && !file.name.startsWith("."),
-      );
+      const loadedDirectory = await collectClaudeCodeDirectoryUploadEntries(files);
 
-      const entries = await Promise.all(
-        supportedFiles.map(async (file) => ({
-          name: file.name,
-          relativePath: file.webkitRelativePath || file.name,
-          text: await file.text(),
-        })),
-      );
-
-      const parsedDirectory = parseSubAgentDirectory(entries);
-      setSubAgentData(parsedDirectory);
-      setSelectedSubAgentKey(parsedDirectory.orderedSessions[0]?.key || "");
-      setSelectedSubAgentType("all");
-      setViewMode("subagents");
+      applyDirectoryEntries(loadedDirectory.entries, {
+        directoryName: loadedDirectory.rootName,
+        skippedFiles: loadedDirectory.skippedFiles,
+      });
     } catch (directoryError) {
       setSubAgentError(directoryError instanceof Error ? directoryError.message : "目录读取失败");
     } finally {
@@ -1017,11 +1256,26 @@ function App() {
       {viewMode === "subagents" ? (
         <SubAgentDirectoryView
           directoryData={subAgentData}
+          directorySource={directorySource}
+          directoryInputRef={workflowDirectoryInputRef}
           error={subAgentError}
           loading={subAgentLoading}
           onDirectoryChange={handleDirectoryChange}
+          onOpenMainSession={(entry) => {
+            setSessionData(entry.sessionData);
+            setSelectedType("all");
+            setViewMode("session");
+          }}
+          onOpenWorkflow={(data) => {
+            setWorkflowData(data);
+            setSelectedWorkflowType("all");
+            setViewMode("workflow");
+          }}
+          onSelectParsedFile={setSelectedParsedFileKey}
           onSelectSession={setSelectedSubAgentKey}
           onSelectType={setSelectedSubAgentType}
+          onSelectWorkflowDirectory={handleWorkflowDirectorySelect}
+          selectedParsedFile={selectedParsedFile}
           selectedSession={selectedSubAgentSession}
           selectedType={selectedSubAgentType}
         />
