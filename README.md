@@ -8,6 +8,10 @@
 
 项目基于 Vite + React。所有目录文件均由浏览器在用户授权后直接从本机读取，项目不包含目录地址输入或本地文件读取接口。
 
+## Figma 设计稿
+
+[查看 Claude Code JSONL Viewer Figma 设计稿](https://www.figma.com/design/5YBfXQfd6LSe2TrsDtSg07)
+
 ## 功能概览
 
 - 单 Session 视图
