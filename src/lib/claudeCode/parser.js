@@ -30,6 +30,24 @@ const META_TYPES = new Set([
 const MARKDOWN_HINT =
   /(^|\n)(#{1,6}\s|[-*]\s|\d+\.\s|>\s)|```|\|.+\||\*\*|`[^`]+`/m;
 
+const STRUCTURAL_CONTENT_KEYS = new Set([
+  "type", "role", "timestamp", "created_at", "updated_at", "uuid", "parent_uuid",
+  "session_id", "agent_id", "tool_use_id", "cwd", "git_branch", "version", "line_number",
+  "is_sidechain", "is_timeline_record", "is_meta_record", "raw",
+]);
+
+function isStructuralContentKey(key) {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/-/g, "_").toLowerCase();
+  return STRUCTURAL_CONTENT_KEYS.has(normalized)
+    || /(?:^|_)(?:id|uuid)$/.test(normalized)
+    || /(?:^|_)timestamp(?:_|$)/.test(normalized)
+    || /^raw(?:_|$)/.test(normalized);
+}
+
+function escapeMarkdownLabel(value) {
+  return String(value).replace(/[\\`*_{}\[\]()#+.!|>~-]/g, "\\$&");
+}
+
 function sortTimeline(a, b) {
   const leftTimestamp = normalizeDateValue(a.timestamp);
   const rightTimestamp = normalizeDateValue(b.timestamp);
@@ -75,11 +93,26 @@ function pickRenderMode(text, preferredMode = "plain") {
   return looksLikeMarkdown(text) ? "markdown" : "plain";
 }
 
+function formatReadableValue(value, label = "") {
+  if (["string", "number", "boolean"].includes(typeof value)) {
+    return label ? `**${escapeMarkdownLabel(label)}:** ${String(value)}` : String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => formatReadableValue(item, `${label}[${index}]`)).filter(Boolean).join("\n\n");
+  }
+  if (!value || typeof value !== "object") return "";
+  return Object.entries(value)
+    .filter(([key, nested]) => !isStructuralContentKey(key) && nested !== null && nested !== undefined)
+    .map(([key, nested]) => formatReadableValue(nested, label ? `${label}.${key}` : key))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 function toJsonBlock(label, value) {
   return {
     label,
-    renderMode: "code",
-    text: JSON.stringify(value, null, 2),
+    renderMode: "markdown",
+    text: formatReadableValue(value) || "没有可提取的文本内容。",
   };
 }
 
@@ -130,8 +163,14 @@ function extractValueBlocks(label, value, preferredMode = "plain") {
         return extractContentItem(item, `${label}[${index}]`);
       }
 
-      return [toTextBlock(`${label}[${index}]`, item, preferredMode)];
+      return extractValueBlocks(`${label}[${index}]`, item, preferredMode);
     });
+  }
+
+  if (typeof value === "object") {
+    return Object.entries(value).flatMap(([key, nested]) => (
+      isStructuralContentKey(key) ? [] : extractValueBlocks(`${label}.${key}`, nested, "markdown")
+    ));
   }
 
   return [toTextBlock(label, value, preferredMode)];
@@ -155,17 +194,15 @@ function extractContentItem(item, label) {
   }
 
   if (item.type === "tool_use" || item.type === "server_tool_use") {
+    const toolLabel = item.name || item.tool_name || item.type;
     return [
-      toJsonBlock(`${label}.${item.type}`, {
-        id: item.id,
-        name: item.name,
-        input: item.input,
-      }),
+      toTextBlock(`${label}.${toolLabel}`, `**${escapeMarkdownLabel(toolLabel)}**`, "markdown"),
+      ...extractValueBlocks(`${label}.${toolLabel}.input`, item.input, "markdown"),
     ];
   }
 
   if (item.type === "redacted_thinking") {
-    return [toJsonBlock(label, item)];
+    return [toTextBlock(label, "思考内容已隐藏。", "plain")];
   }
 
   if (typeof item.text === "string") {
@@ -176,7 +213,7 @@ function extractContentItem(item, label) {
     return extractValueBlocks(`${label}.content`, item.content, "plain");
   }
 
-  return [toJsonBlock(label, item)];
+  return extractValueBlocks(label, item, "markdown");
 }
 
 function extractMessageBlocks(message) {
@@ -196,7 +233,7 @@ function extractMessageBlocks(message) {
 
   if (!Array.isArray(message.content)) {
     return message.content && typeof message.content === "object"
-      ? [toJsonBlock("message.content", message.content)]
+      ? extractValueBlocks("message.content", message.content, "markdown")
       : [];
   }
 
@@ -292,53 +329,14 @@ function extractToolUseResultBlocks(result) {
     return extractValueBlocks("toolUseResult", result, "plain");
   }
 
-  const blocks = [];
-  for (const key of ["stdout", "stderr", "output", "content"]) {
-    if (result[key] !== null && result[key] !== undefined && result[key] !== "") {
-      blocks.push(...extractValueBlocks(`toolUseResult.${key}`, result[key], "plain"));
-    }
-  }
-
-  const summary = summarizeObject(
-    Object.fromEntries(
-      Object.entries(result).filter(
-        ([key]) => !["stdout", "stderr", "output", "content"].includes(key),
-      ),
-    ),
-  );
-  if (summary.length) {
-    blocks.push({
-      label: "toolUseResult.summary",
-      renderMode: "plain",
-      text: summary.map((item) => `${item.key}: ${item.value}`).join("\n"),
-    });
-  }
-
-  return blocks.length ? blocks : [toJsonBlock("toolUseResult", result)];
+  const blocks = extractValueBlocks("toolUseResult", result, "plain");
+  return blocks;
 }
 
 function extractGenericRecordBlocks(record) {
-  const blocks = [];
-  const structuralKeys = new Set([
-    "type",
-    "timestamp",
-    "uuid",
-    "parentUuid",
-    "sessionId",
-    "session_id",
-    "agentId",
-    "isSidechain",
-    "cwd",
-    "gitBranch",
-    "version",
-    "lineNumber",
-    "raw",
-    "isTimelineRecord",
-    "isMetaRecord",
-  ]);
-
+  const blocks = [toTextBlock("", "")].slice(0, 0);
   for (const [key, value] of Object.entries(record)) {
-    if (structuralKeys.has(key) || value === null || value === undefined || value === "") {
+    if (isStructuralContentKey(key) || value === null || value === undefined || value === "") {
       continue;
     }
 
@@ -352,7 +350,7 @@ function extractGenericRecordBlocks(record) {
       continue;
     }
 
-    blocks.push(toJsonBlock(key, value));
+    blocks.push(...extractValueBlocks(key, value, "markdown"));
   }
 
   return blocks;
