@@ -189,17 +189,33 @@ function firstVisibleScalar(...values) {
   return values.map(visibleScalar).find(Boolean) || "";
 }
 
+const STRUCTURAL_CONTENT_KEYS = new Set([
+  "type", "role", "timestamp", "created_at", "updated_at", "uuid", "parent_uuid",
+  "session_id", "agent_id", "tool_use_id", "cwd", "git_branch", "version", "line_number",
+  "is_sidechain", "is_timeline_record", "is_meta_record", "raw",
+]);
+
+function isStructuralContentKey(key) {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/-/g, "_").toLowerCase();
+  return STRUCTURAL_CONTENT_KEYS.has(normalized)
+    || /(?:^|_)(?:id|uuid)$/.test(normalized)
+    || /(?:^|_)timestamp(?:_|$)/.test(normalized)
+    || /^raw(?:_|$)/.test(normalized);
+}
+
+function escapeMarkdownLabel(value) {
+  return String(value).replace(/[\\`*_{}\[\]()#+.!|>~-]/g, "\\$&");
+}
+
 function extractReadableText(value) {
   if (["string", "number", "boolean"].includes(typeof value)) return String(value);
   if (Array.isArray(value)) return value.map(extractReadableText).filter(Boolean).join("\n");
   if (!value || typeof value !== "object") return "";
-  for (const key of ["text", "content", "output", "stdout", "stderr", "result"]) {
-    if (value[key] !== undefined && value[key] !== null) {
-      const text = extractReadableText(value[key]);
-      if (text) return text;
-    }
-  }
-  return "";
+  return Object.entries(value).flatMap(([key, nested]) => {
+    if (isStructuralContentKey(key) || nested === null || nested === undefined) return [];
+    const text = extractReadableText(nested);
+    return text.trim() ? [`**${escapeMarkdownLabel(key)}:** ${text}`] : [];
+  }).join("\n\n");
 }
 
 function extractThoughtParts(value) {
@@ -237,11 +253,19 @@ function extractContentParts(content) {
   }
   if (!Array.isArray(content)) {
     if (content && typeof content === "object" && ["tool_use", "server_tool_use"].includes(content.type)) {
-      return [{ kind: "tool", name: firstVisibleScalar(content.name, content.tool_name) || "未知工具" }];
+      const name = firstVisibleScalar(content.name, content.tool_name) || "未知工具";
+      const input = extractReadableText(content.input);
+      return [
+        { kind: "tool", name },
+        ...(input.trim() ? [{ kind: "markdown", label: `工具输入 · ${name}`, text: input }] : []),
+      ];
     }
     if (content && typeof content === "object" && content.type === "thinking") {
       const text = extractReadableText(content.thinking) || extractReadableText(content.text) || extractReadableText(content.content);
       return text.trim() ? [{ kind: "markdown", label: "思考", text }] : [];
+    }
+    if (content && typeof content === "object" && content.type === "redacted_thinking") {
+      return [{ kind: "markdown", label: "思考", text: "思考内容已隐藏。" }];
     }
     if (content && typeof content === "object" && content.type === "tool_result") {
       const text = extractReadableText(content.content ?? content.result);
@@ -258,7 +282,15 @@ function extractContentParts(content) {
     if (typeof item === "string") return item.trim() ? [{ kind: "markdown", label: "正文", text: item }] : [];
     if (!item || typeof item !== "object") return [];
     if (["tool_use", "server_tool_use"].includes(item.type)) {
-      return [{ kind: "tool", name: firstVisibleScalar(item.name, item.tool_name) || "未知工具" }];
+      const name = firstVisibleScalar(item.name, item.tool_name) || "未知工具";
+      const input = extractReadableText(item.input);
+      return [
+        { kind: "tool", name },
+        ...(input.trim() ? [{ kind: "markdown", label: `工具输入 · ${name}`, text: input }] : []),
+      ];
+    }
+    if (item.type === "redacted_thinking") {
+      return [{ kind: "markdown", label: "思考", text: "思考内容已隐藏。" }];
     }
     if (item.type === "tool_result") {
       const text = extractReadableText(item.content ?? item.result);
